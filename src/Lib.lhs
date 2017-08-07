@@ -102,28 +102,45 @@ Also wait for channel to be non-Busy?
 
 Hack: make use of the fact that all packets are same length?
 
-> send ticker transmitter ack channel length = lift $ do
+> send :: ReadOnlyTVar Time -> TVar Time -> _ -> _ -> Int -> Network Bool
+> send ticker highwaterMark ack channel length = lift $ do
 >   end <- atomically $ do
 >       Time t <- RO.readTVar ticker
 >       let end = Time $ t + length
->       writeTVar transmitter end
+>       writeTVar highwaterMark (Time t)
 >       modifyTVar channel (1+)
 >       return end
->   atomically $ do
->       t <- RO.readTVar ticker
->       users <- readTVar channel
->       if 1 < users
->           then return False
->           else if end <= t
->               then return True
->               else retry
+>   loopUntilJust $ atomically $ do
+>     t <- RO.readTVar ticker
+>     users <- readTVar channel
+>     highwater <- readTVar highwaterMark
+>     case () of
+>      () | 1 < users -> return (Just False)
+>         | end <= t -> return (Just False)
+>         | highwater >= t -> retry
+>         | otherwise -> do
+>             writeTVar highwaterMark t
+>             return Nothing
 
-> wait :: ReadOnlyTVar Time -> Int -> RandT StdGen IO ()
-> wait ticker i = lift $ do
->   Time n <- atomically $ RO.readTVar ticker
->   atomically $ do
->       Time n' <- RO.readTVar ticker
->       unless (n + i <= n') retry
+> loopUntilJust :: Monad m => m (Maybe a) -> m a
+> loopUntilJust step = do
+>   result <- step
+>   case result of
+>       Nothing -> loopUntilJust step
+>       Just c -> return c
+
+> wait :: ReadOnlyTVar Time -> TVar Time -> Int -> RandT StdGen IO ()
+> wait ticker highwaterMark i = lift $ do
+>   Time start <- atomically $ readTVar highwaterMark
+>   atomically . writeTVar highwaterMark <=< loopUntilJust . atomically $ do
+>       Time last <- readTVar highwaterMark
+>       Time t <- RO.readTVar ticker
+>       case () of
+>        () | start + i <= t -> return (Just (Time t))
+>           | last >= t -> retry
+>           | otherwise -> do
+>               writeTVar highwaterMark (Time t)
+>               return Nothing
 
 Consider enforcing a one-tick wait here:
 
@@ -135,15 +152,15 @@ Consider enforcing a one-tick wait here:
 >       roChannel = toReadOnlyTVar channel
 >   let makeNode = do
 >           s <- getSplit
->           transmitter <- lift $ atomically $ newTVar 0
+>           highwaterMark <- lift $ atomically $ newTVar 0
 >           ack <- lift $ atomically $ newTVar 0
 >           node <- lift $ forkIO $ evalRandT
->               (aloha (wait roTick)
+>               (aloha (wait roTick highwaterMark)
 >                      (senseUntilIdle roTick channel)
->                      (send roTick transmitter ack channel)
+>                      (send roTick highwaterMark ack channel)
 >                      pSend
 >                      (replicate numPackets (Package length)))
 >               s
->           return (transmitter, node)
+>           return (highwaterMark, node)
 >   nodes <- replicateM numNodes makeNode
 >   return nodes
