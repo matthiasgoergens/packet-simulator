@@ -5,6 +5,9 @@
 > import Control.Monad
 > import Control.Monad.Random.Strict
 > import Control.Concurrent
+> import qualified Control.Concurrent.STM.TVar.ReadOnly as RO
+> import Control.Concurrent.STM.TVar.ReadOnly (toReadOnlyTVar, ReadOnlyTVar)
+
 
 Medium Access protocols govern how and when nodes can communicate over a shared wireless
 channel.
@@ -71,39 +74,25 @@ Need to get stuff done: so just stick everything in IO and use TVar.
 
 -- model time steps explicitly?
 
-> type Network x = IO x
+> type Network x = RandT StdGen IO x
 
-> transmit :: Package a -> Network Transmit
-> transmit _ = undefined
-
-> listen = undefined
-
-> sendPayload :: Package a -> Network _
-> sendPayload p = do
->   id <- transmit p
->   listen >>= \case
->       Right id' | id == id' -> undefined
->       Left _ -> undefined  -- backoff, send again.
-
-> listenAndConfirm :: NodeId -> Network _
-> listenAndConfirm me = do
->   listen >>= \case
->       Right (Package a) -> undefined
->       Right _ -> return ()
->       Left _ -> return ()
-
-> aloha :: _ -> RandT StdGen IO () -> _ -> Rational -> [Package Int] -> RandT StdGen IO ()
-> aloha wait senseUntilIdle send pSend = loop where
+> aloha :: (Int -> Network ()) -> Network () -> (Int -> Network Bool) ->
+>           Rational -> [Package Int] -> RandT StdGen IO ()
+> aloha wait senseUntilIdle send1 pSend = loop where
 >   loop :: [Package Int] -> RandT StdGen IO ()
 >   loop (Package p:ps) = do
 >       senseUntilIdle
->       join $ fromList [ (send p >> loop ps, pSend)
+>       -- No exponential back-off.
+>       let send = do
+>               success <- send1 p
+>               if success then loop ps else loop (Package p:ps)
+>       join $ fromList [ (send, pSend)
 >                       , (wait 1 >> loop (Package p:ps), 1-pSend)]
 >   loop [] = return ()
 
 > confirm = undefined
 
-> senseUntilIdle :: TVar Time -> TVar CarrierSense -> RandT StdGen IO ()
+> senseUntilIdle :: ReadOnlyTVar Time -> TVar CarrierSense -> RandT StdGen IO ()
 > senseUntilIdle ticker channel = lift $ atomically $ do
 >   readTVar channel >>= \case
 >       x  | x <= 0 -> return ()
@@ -111,31 +100,47 @@ Need to get stuff done: so just stick everything in IO and use TVar.
 
 Also wait for channel to be non-Busy?
 
-> send ticker transmitter ack channel length = lift $ atomically $ do
->   Time t <- readTVar ticker
->   writeTVar transmitter (Time $ t+length)
->   --- Needs to report success.
+Hack: make use of the fact that all packets are same length?
 
-> wait ticker i = lift $ do
->   n <- atomically $ readTVar ticker
+> send ticker transmitter ack channel length = lift $ do
+>   end <- atomically $ do
+>       Time t <- RO.readTVar ticker
+>       let end = Time $ t + length
+>       writeTVar transmitter end
+>       modifyTVar channel (1+)
+>       return end
 >   atomically $ do
->       n' <- readTVar ticker
+>       t <- RO.readTVar ticker
+>       users <- readTVar channel
+>       if 1 < users
+>           then return False
+>           else if end <= t
+>               then return True
+>               else retry
+
+> wait :: ReadOnlyTVar Time -> Int -> RandT StdGen IO ()
+> wait ticker i = lift $ do
+>   Time n <- atomically $ RO.readTVar ticker
+>   atomically $ do
+>       Time n' <- RO.readTVar ticker
 >       unless (n + i <= n') retry
 
 Consider enforcing a one-tick wait here:
 
-> setup :: Rational -> Int -> Int -> Int -> RandT _ IO _
+> setup :: Rational -> Int -> Int -> Int -> Network _
 > setup pSend numNodes numPackets length = do
 >   tick <- lift $ atomically $ newTVar 0
 >   channel <- lift $ atomically $ newTVar 0
+>   let roTick = toReadOnlyTVar tick
+>       roChannel = toReadOnlyTVar channel
 >   let makeNode = do
 >           s <- getSplit
 >           transmitter <- lift $ atomically $ newTVar 0
 >           ack <- lift $ atomically $ newTVar 0
 >           node <- lift $ forkIO $ evalRandT
->               (aloha (wait tick)
->                      (senseUntilIdle tick channel)
->                      (send tick transmitter ack channel)
+>               (aloha (wait roTick)
+>                      (senseUntilIdle roTick channel)
+>                      (send roTick transmitter ack channel)
 >                      pSend
 >                      (replicate numPackets (Package length)))
 >               s
