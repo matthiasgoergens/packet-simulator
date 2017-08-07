@@ -7,6 +7,7 @@
 > import Control.Concurrent
 > import qualified Control.Concurrent.STM.TVar.ReadOnly as RO
 > import Control.Concurrent.STM.TVar.ReadOnly (toReadOnlyTVar, ReadOnlyTVar)
+> import System.Random
 
 
 Medium Access protocols govern how and when nodes can communicate over a shared wireless
@@ -77,8 +78,9 @@ Need to get stuff done: so just stick everything in IO and use TVar.
 > type Network x = RandT StdGen IO x
 
 > aloha :: (Int -> Network ()) -> Network () -> (Int -> Network Bool) ->
+>          Network () ->
 >           Rational -> [Package Int] -> RandT StdGen IO ()
-> aloha wait senseUntilIdle send1 pSend = loop where
+> aloha wait senseUntilIdle send1 done pSend = loop where
 >   loop :: [Package Int] -> RandT StdGen IO ()
 >   loop (Package p:ps) = do
 >       senseUntilIdle
@@ -88,7 +90,7 @@ Need to get stuff done: so just stick everything in IO and use TVar.
 >               if success then loop ps else loop (Package p:ps)
 >       join $ fromList [ (send, pSend)
 >                       , (wait 1 >> loop (Package p:ps), 1-pSend)]
->   loop [] = return ()
+>   loop [] = done
 
 > confirm = undefined
 
@@ -102,8 +104,8 @@ Also wait for channel to be non-Busy?
 
 Hack: make use of the fact that all packets are same length?
 
-> send :: ReadOnlyTVar Time -> TVar Time -> _ -> _ -> Int -> Network Bool
-> send ticker highwaterMark ack channel length = lift $ do
+> send :: ReadOnlyTVar Time -> TVar Time -> TVar CarrierSense -> Int -> Network Bool
+> send ticker highwaterMark channel length = lift $ do
 >   end <- atomically $ do
 >       Time t <- RO.readTVar ticker
 >       let end = Time $ t + length
@@ -129,7 +131,7 @@ Hack: make use of the fact that all packets are same length?
 >       Nothing -> loopUntilJust step
 >       Just c -> return c
 
-> wait :: ReadOnlyTVar Time -> TVar Time -> Int -> RandT StdGen IO ()
+> wait :: ReadOnlyTVar Time -> TVar Time -> Int -> Network ()
 > wait ticker highwaterMark i = lift $ do
 >   Time start <- atomically $ readTVar highwaterMark
 >   atomically . writeTVar highwaterMark <=< loopUntilJust . atomically $ do
@@ -144,23 +146,40 @@ Hack: make use of the fact that all packets are same length?
 
 Consider enforcing a one-tick wait here:
 
-> setup :: Rational -> Int -> Int -> Int -> Network _
+> setup :: Rational -> Int -> Int -> Int -> Network ()
 > setup pSend numNodes numPackets length = do
 >   tick <- lift $ atomically $ newTVar 0
 >   channel <- lift $ atomically $ newTVar 0
->   let roTick = toReadOnlyTVar tick
+>   let roTick :: ReadOnlyTVar Time
+>       roTick = toReadOnlyTVar tick
 >       roChannel = toReadOnlyTVar channel
 >   let makeNode = do
 >           s <- getSplit
 >           highwaterMark <- lift $ atomically $ newTVar 0
->           ack <- lift $ atomically $ newTVar 0
+>           done <- lift $ atomically $ newTVar False
 >           node <- lift $ forkIO $ evalRandT
 >               (aloha (wait roTick highwaterMark)
 >                      (senseUntilIdle roTick channel)
->                      (send roTick highwaterMark ack channel)
+>                      (send roTick highwaterMark channel)
+>                      (lift . atomically $ writeTVar done True)
 >                      pSend
 >                      (replicate numPackets (Package length)))
 >               s
->           return (highwaterMark, node)
->   nodes <- replicateM numNodes makeNode
->   return nodes
+>           return (highwaterMark, node, done)
+>   alohas <- replicateM numNodes makeNode
+>   let (marks, nodes, dones) = unzip3 alohas
+
+>   lift $ loopUntilJust $ atomically $ do
+>     areDone <- mapM readTVar dones
+>     if and areDone
+>     then return (Just ())
+>     else do
+>       t <- readTVar tick
+>       marks_ <- mapM readTVar marks
+>       when (maximum marks_ < t) retry
+>       modifyTVar tick (1+)
+>       return Nothing
+
+> main = do
+>   g <- getStdGen
+>   evalRandT (setup (1/5) 20 10 500) g
