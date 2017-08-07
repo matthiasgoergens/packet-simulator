@@ -1,5 +1,10 @@
-> {-# LANGUAGE LambdaCase #-}
+> {-# LANGUAGE LambdaCase, PartialTypeSignatures, GeneralizedNewtypeDeriving #-}
 > module Lib where
+> import Control.Concurrent.STM
+> import Control.Concurrent.STM.TVar
+> import Control.Monad
+> import Control.Monad.Random.Strict
+> import Control.Concurrent
 
 Medium Access protocols govern how and when nodes can communicate over a shared wireless
 channel.
@@ -25,6 +30,10 @@ packets to send and no new packets arrive. With the aid of your simulator:
 
 ---
 
+Don't simulate acks.
+
+---
+
 So, we need to come up with a type to plug our node simulator in.
 
 - ability to 'wait'
@@ -37,16 +46,99 @@ So, we need to come up with a type to plug our node simulator in.
 
 - send messages/events to self and inject them?
 
-> data Action a b = Send a | Receive b
+Abstract state machine?
 
-> aloha :: IO ()
-> aloha = do
->   handleEvents
->   aloha
+a node needs: packages still to send.
+waiting / not?
 
-> waitForEvent x = x (Send ())
+---
 
-> handleEvents = do
->   waitForEvent $ \case
->       Send msg -> return ()
->       Receive x -> return ()
+Need to get stuff done: so just stick everything in IO and use TVar.
+
+> newtype Time = Time Int
+>   deriving (Eq, Ord, Show, Num)
+> newtype CarrierSense = CarrierSense Int
+>   deriving (Eq, Ord, Show, Num)
+> newtype PackageId = PackageId Int
+>   deriving (Eq, Ord, Show)
+> data Transmit = Transmit PackageId
+>   deriving (Eq, Ord, Show)
+
+> newtype NodeId = NodeId Int
+>   deriving (Eq, Ord, Show)
+> data Package a = Package a
+>   deriving (Eq, Ord, Show)
+
+-- model time steps explicitly?
+
+> type Network x = IO x
+
+> transmit :: Package a -> Network Transmit
+> transmit _ = undefined
+
+> listen = undefined
+
+> sendPayload :: Package a -> Network _
+> sendPayload p = do
+>   id <- transmit p
+>   listen >>= \case
+>       Right id' | id == id' -> undefined
+>       Left _ -> undefined  -- backoff, send again.
+
+> listenAndConfirm :: NodeId -> Network _
+> listenAndConfirm me = do
+>   listen >>= \case
+>       Right (Package a) -> undefined
+>       Right _ -> return ()
+>       Left _ -> return ()
+
+> aloha :: _ -> RandT StdGen IO () -> _ -> Rational -> [Package Int] -> RandT StdGen IO ()
+> aloha wait senseUntilIdle send pSend = loop where
+>   loop :: [Package Int] -> RandT StdGen IO ()
+>   loop (Package p:ps) = do
+>       senseUntilIdle
+>       join $ fromList [ (send p >> loop ps, pSend)
+>                       , (wait 1 >> loop (Package p:ps), 1-pSend)]
+>   loop [] = return ()
+
+> confirm = undefined
+
+> senseUntilIdle :: TVar Time -> TVar CarrierSense -> RandT StdGen IO ()
+> senseUntilIdle ticker channel = lift $ atomically $ do
+>   readTVar channel >>= \case
+>       x  | x <= 0 -> return ()
+>       _ -> retry
+
+Also wait for channel to be non-Busy?
+
+> send ticker transmitter ack channel length = lift $ atomically $ do
+>   Time t <- readTVar ticker
+>   writeTVar transmitter (Time $ t+length)
+>   --- Needs to report success.
+
+> wait ticker i = lift $ do
+>   n <- atomically $ readTVar ticker
+>   atomically $ do
+>       n' <- readTVar ticker
+>       unless (n + i <= n') retry
+
+Consider enforcing a one-tick wait here:
+
+> setup :: Rational -> Int -> Int -> Int -> RandT _ IO _
+> setup pSend numNodes numPackets length = do
+>   tick <- lift $ atomically $ newTVar 0
+>   channel <- lift $ atomically $ newTVar 0
+>   let makeNode = do
+>           s <- getSplit
+>           transmitter <- lift $ atomically $ newTVar 0
+>           ack <- lift $ atomically $ newTVar 0
+>           node <- lift $ forkIO $ evalRandT
+>               (aloha (wait tick)
+>                      (senseUntilIdle tick channel)
+>                      (send tick transmitter ack channel)
+>                      pSend
+>                      (replicate numPackets (Package length)))
+>               s
+>           return (transmitter, node)
+>   nodes <- replicateM numNodes makeNode
+>   return nodes
